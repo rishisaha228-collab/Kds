@@ -593,8 +593,9 @@ def _page_toc(pu):
 
 
 def exists(u):
-    """Chapter URL asli content deta hai ya nahi (redirect-to-last-chapter wale sites bhi sambhalta hai)."""
+    """True = chapter hai, False = pakka nahi hai (404/redirect/khali), None = pata nahi (block/timeout)."""
     alt = u[:-1] if u.endswith("/") else u + "/"
+    unknown = False
     for a in range(2):
         try:
             t, final = fetch_full((u, alt)[a], UAS[a % len(UAS)])
@@ -610,12 +611,25 @@ def exists(u):
         except FetchError as e:
             if e.code in (404, 410):
                 continue  # slash wala/bina slash wala dusra roop bhi dekho
+            unknown = True
             time.sleep(e.wait or 1.5)
         except ParseError:
             return False
         except Exception:  # noqa: BLE001
+            unknown = True
             time.sleep(1)
-    return False
+    return None if unknown else False
+
+
+def _exists_gap(sample, n):
+    """n, n+1, n+2 me se koi mile to True (kabhi kabhi ek-do chapter gayab hote hain). None = pata nahi."""
+    unk = False
+    for k in (n, n + 1, n + 2):
+        r = exists(chapter_url(sample, k))
+        if r:
+            return True
+        unk = unk or r is None
+    return None if unk else False
 
 
 def extend(urls, hint):
@@ -630,13 +644,19 @@ def extend(urls, hint):
     lo = max(nums)
     sample = nums[lo]
     total = lo
-    if hint > lo and exists(chapter_url(sample, hint)):
-        total = hint
-    if exists(chapter_url(sample, total + 1)):
+    if hint > lo:
+        r = exists(chapter_url(sample, hint))
+        if r or r is None:  # block ho raha ho to bhi page ke "N chapters" par bharosa karo
+            total = hint
+    probe = _exists_gap(sample, total + 1)
+    if probe is None and hint <= lo:
+        log("chapter probe: site jawab nahi de rahi, list jaisi mili waisi rakh raha hoon")
+    elif probe:
         good, step, bad = total + 1, 8, None
         while good < MAX_CHAPTERS:
             t = min(good + step, MAX_CHAPTERS)
-            if exists(chapter_url(sample, t)):
+            r = _exists_gap(sample, t)
+            if r:
                 good, step = t, step * 2
             else:
                 bad = t
@@ -646,7 +666,7 @@ def extend(urls, hint):
         else:
             while bad - good > 1:
                 mid = (good + bad) // 2
-                if exists(chapter_url(sample, mid)):
+                if _exists_gap(sample, mid):
                     good = mid
                 else:
                     bad = mid
@@ -658,13 +678,31 @@ def extend(urls, hint):
     return [u for u in out if u]
 
 
+_PAGE_Q = re.compile(r"[?&](?:page|p|pg|paged)=\d+")
+
+
+def _walk_pages(pu, dirp, known):
+    """Novel page ke ?page=2,3,... tab tak kholo jab tak naye chapter aate rahein (links na bhi hon to)."""
+    base = parse.urlunparse(parse.urlparse(pu)._replace(query="", fragment=""))
+    new = []
+    for pg in range(2, 121):
+        got = _page_toc(f"{base}?page={pg}")
+        fresh = [u for u in got if u not in known and parse.urlparse(u).path.rsplit("/", 1)[0] == dirp]
+        if not fresh:
+            break
+        for u in fresh:
+            known.add(u)
+        new += fresh
+    return new
+
+
 def gather(root, url):
     links = find_links(root, url)
     base = toc_from_links(links)
     if not base:
         return []
     urls = list(base)
-    pages = [u for u in links if re.search(r"[?&](?:page|p)=\d+", u)][:60]
+    pages = [u for u in links if _PAGE_Q.search(u) or re.search(r"/page[-/]\d+/?$", u)][:80]
     if pages:
         with cf.ThreadPoolExecutor(8) as ex:
             for more in ex.map(_page_toc, pages):
@@ -675,8 +713,13 @@ def gather(root, url):
         if u not in seen and parse.urlparse(u).path.rsplit("/", 1)[0] == dirp:
             seen.add(u)
             uniq.append(u)
-    hints = [int(x) for x in re.findall(r"(\d{2,5})\s+chapters?", ntext(root), re.I)
-             if int(x) <= MAX_CHAPTERS]
+    # Page ke "?page=N" links dikhe na hon to bhi khud page 2,3,... try karo (novel ka main page).
+    if not numof(url):
+        uniq += _walk_pages(url, dirp, seen)
+    text = ntext(root)
+    hints = [int(x) for x in re.findall(r"(\d{2,5})\s+chapters?", text, re.I)]
+    hints += [int(x) for x in re.findall(r"chapters?\s*[:(\-]\s*(\d{2,5})", text, re.I)]
+    hints = [h for h in hints if h <= MAX_CHAPTERS]
     return extend(uniq, max(hints or [0]))
 
 
@@ -1347,10 +1390,12 @@ class Bot:
             root = parse_doc(page)
             title = page_info(root, sess.url)
             urls = gather(root, sess.url)
-            if not urls and numof(sess.url) is not None:
-                urls, t2 = parent_toc(sess.url)
-                if urls and t2:
-                    title = t2
+            if numof(sess.url) is not None:  # chapter link: novel ke main page se poori list bhi dekho
+                u2, t2 = parent_toc(sess.url)
+                if len(u2) > len(urls):
+                    urls = u2
+                    if t2:
+                        title = t2
             refs = mk_refs(urls) if urls else []
             if not refs and numof(sess.url) is None:
                 raise ParseError("Chapter list nahi mili. Novel ka main page ka link bhejo.")
